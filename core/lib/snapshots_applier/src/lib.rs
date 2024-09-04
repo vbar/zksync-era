@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tokio::sync::{watch, Semaphore};
 use zksync_dal::{Connection, ConnectionPool, Core, CoreDal, DalError, SqlxError};
+use zksync_eth_client::{ClientError, EthInterface};
 use zksync_health_check::{Health, HealthStatus, HealthUpdater, ReactiveHealthCheck};
 use zksync_object_store::{ObjectStore, ObjectStoreError};
 use zksync_types::{
@@ -18,11 +19,12 @@ use zksync_types::{
         SnapshotStorageLogsChunk, SnapshotStorageLogsStorageKey, SnapshotVersion,
     },
     tokens::TokenInfo,
+    web3::BlockId,
     L1BatchNumber, L2BlockNumber, StorageKey, H256,
 };
 use zksync_utils::bytecode::hash_bytecode;
 use zksync_web3_decl::{
-    client::{DynClient, L2},
+    client::{DynClient, L1, L2},
     error::{ClientRpcContext, EnrichedClientError, EnrichedClientResult},
     jsonrpsee::core::client,
     namespaces::{EnNamespaceClient, SnapshotsNamespaceClient, ZksNamespaceClient},
@@ -197,6 +199,29 @@ impl SnapshotsApplierMainNodeClient for Box<DynClient<L2>> {
     }
 }
 
+#[async_trait]
+pub trait SnapshotsApplierL1Client: fmt::Debug + Send + Sync {
+    async fn acquire_l1_batch_root_hash(&self, number: L1BatchNumber)
+        -> EnrichedClientResult<H256>;
+}
+
+#[async_trait]
+impl SnapshotsApplierL1Client for Box<DynClient<L1>> {
+    async fn acquire_l1_batch_root_hash(
+        &self,
+        number: L1BatchNumber,
+    ) -> EnrichedClientResult<H256> {
+        let eth_client: &dyn EthInterface = self;
+        let block_id = BlockId::Number(number.0.into());
+        let block = eth_client.block(block_id).await?.ok_or_else(|| {
+            let err = "block missing on L1 RPC provider";
+            EnrichedClientError::new(ClientError::Custom(err.into()), "get_block")
+                .with_arg("number", &number)
+        })?;
+        Ok(block.state_root)
+    }
+}
+
 /// Reported status of the snapshot recovery progress.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RecoveryCompletionStatus {
@@ -261,6 +286,7 @@ pub struct SnapshotsApplierTask {
     health_updater: HealthUpdater,
     connection_pool: ConnectionPool<Core>,
     main_node_client: Box<dyn SnapshotsApplierMainNodeClient>,
+    l1_client: Box<dyn SnapshotsApplierL1Client>,
     blob_store: Arc<dyn ObjectStore>,
     local_snapshot_dir: Option<String>,
 }
@@ -270,6 +296,7 @@ impl SnapshotsApplierTask {
         config: SnapshotsApplierConfig,
         connection_pool: ConnectionPool<Core>,
         main_node_client: Box<dyn SnapshotsApplierMainNodeClient>,
+        l1_client: Box<dyn SnapshotsApplierL1Client>,
         blob_store: Arc<dyn ObjectStore>,
         local_snapshot_dir: Option<String>,
     ) -> Self {
@@ -280,6 +307,7 @@ impl SnapshotsApplierTask {
             health_updater: ReactiveHealthCheck::new("snapshot_recovery").1,
             connection_pool,
             main_node_client,
+            l1_client,
             blob_store,
             local_snapshot_dir,
         }
@@ -433,6 +461,7 @@ impl SnapshotRecoveryStrategy {
     async fn new(
         storage: &mut Connection<'_, Core>,
         main_node_client: &dyn SnapshotsApplierMainNodeClient,
+        l1_client: &dyn SnapshotsApplierL1Client,
         snapshot_l1_batch: Option<L1BatchNumber>,
         recovery_type: SnapshotRecoveryType,
     ) -> Result<(Self, SnapshotRecoveryStatus), SnapshotsApplierError> {
@@ -482,8 +511,12 @@ impl SnapshotRecoveryStrategy {
                     Self::create_fresh_recovery_status(main_node_client, snapshot_l1_batch).await?
                 }
                 SnapshotRecoveryType::Local { snapshot_dir } => {
-                    Self::create_fresh_recovery_status_from_local(main_node_client, snapshot_dir)
-                        .await?
+                    Self::create_fresh_recovery_status_from_local(
+                        main_node_client,
+                        l1_client,
+                        snapshot_dir,
+                    )
+                    .await?
                 }
             };
 
@@ -508,6 +541,7 @@ impl SnapshotRecoveryStrategy {
 
     async fn create_fresh_recovery_status_from_local(
         main_node_client: &dyn SnapshotsApplierMainNodeClient,
+        l1_client: &dyn SnapshotsApplierL1Client,
         snapshot_dir: String,
     ) -> Result<(SnapshotRecoveryStatus, SnapshotVersion), SnapshotsApplierError> {
         let snapshot = read_local_snapshot_header(&snapshot_dir)?;
@@ -525,10 +559,14 @@ impl SnapshotRecoveryStrategy {
             .fetch_l1_batch_details(l1_batch_number)
             .await?
             .with_context(|| format!("L1 batch #{l1_batch_number} is missing on main node"))?;
-        let l1_batch_root_hash = l1_batch
+        let doomed_l1_batch_root_hash = l1_batch
             .base
             .root_hash
             .context("snapshot L1 batch fetched from main node doesn't have root hash set")?;
+        let l1_batch_root_hash = l1_client
+            .acquire_l1_batch_root_hash(l1_batch_number)
+            .await?;
+        assert_eq!(doomed_l1_batch_root_hash, l1_batch_root_hash);
         let l2_block = main_node_client
             .fetch_l2_block_details(l2_block_number)
             .await?
@@ -745,6 +783,7 @@ impl<'a> SnapshotsApplier<'a> {
         let health_updater = &task.health_updater;
         let connection_pool = &task.connection_pool;
         let main_node_client = task.main_node_client.as_ref();
+        let l1_client = task.l1_client.as_ref();
 
         // While the recovery is in progress, the node is healthy (no error has occurred),
         // but is affected (its usual APIs don't work).
@@ -766,6 +805,7 @@ impl<'a> SnapshotsApplier<'a> {
         let (strategy, applied_snapshot_status) = SnapshotRecoveryStrategy::new(
             &mut storage_transaction,
             main_node_client,
+            l1_client,
             task.snapshot_l1_batch,
             recovery_type,
         )

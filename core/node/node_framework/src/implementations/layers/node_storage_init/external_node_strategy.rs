@@ -11,6 +11,7 @@ use zksync_types::L2ChainId;
 use super::NodeInitializationStrategyResource;
 use crate::{
     implementations::resources::{
+        eth_interface::EthInterfaceResource,
         healthcheck::AppHealthCheckResource,
         main_node_client::MainNodeClientResource,
         pools::{MasterPool, PoolResource},
@@ -33,6 +34,7 @@ pub struct ExternalNodeInitStrategyLayer {
 pub struct Input {
     pub master_pool: PoolResource<MasterPool>,
     pub main_node_client: MainNodeClientResource,
+    pub eth_interface: EthInterfaceResource,
     pub block_reverter: Option<BlockReverterResource>,
     #[context(default)]
     pub app_health: AppHealthCheckResource,
@@ -56,6 +58,7 @@ impl WiringLayer for ExternalNodeInitStrategyLayer {
     async fn wire(self, input: Self::Input) -> Result<Self::Output, WiringError> {
         let pool = input.master_pool.get().await?;
         let MainNodeClientResource(client) = input.main_node_client;
+        let EthInterfaceResource(l1_client) = input.eth_interface;
         let AppHealthCheckResource(app_health) = input.app_health;
         let block_reverter = match input.block_reverter {
             Some(reverter) => {
@@ -83,6 +86,7 @@ impl WiringLayer for ExternalNodeInitStrategyLayer {
                     .await?;
                 let recovery = Arc::new(ExternalNodeSnapshotRecovery {
                     client: client.clone(),
+                    l1_client: l1_client.clone(),
                     pool: recovery_pool,
                     recovery_config,
                     app_health,

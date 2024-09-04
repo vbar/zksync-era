@@ -13,6 +13,7 @@ categories.workspace = true
 [dependencies]
 zksync_db_connection.workspace = true
 zksync_dal.workspace = true
+zksync_eth_client.workspace = true
 zksync_health_check.workspace = true
 zksync_types.workspace = true
 zksync_object_store.workspace = true
