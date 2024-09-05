@@ -10,13 +10,14 @@ use zksync_shared_metrics::{SnapshotRecoveryStage, APP_METRICS};
 use zksync_snapshots_applier::{
     RecoveryCompletionStatus, SnapshotsApplierConfig, SnapshotsApplierTask,
 };
-use zksync_web3_decl::client::{DynClient, L2};
+use zksync_web3_decl::client::{DynClient, L1, L2};
 
 use crate::{InitializeStorage, SnapshotRecoveryConfig};
 
 #[derive(Debug)]
 pub struct ExternalNodeSnapshotRecovery {
     pub client: Box<DynClient<L2>>,
+    pub l1_client: Box<DynClient<L1>>,
     pub pool: ConnectionPool<Core>,
     pub recovery_config: SnapshotRecoveryConfig,
     pub app_health: Arc<AppHealthCheck>,
@@ -50,6 +51,7 @@ impl InitializeStorage for ExternalNodeSnapshotRecovery {
             config,
             pool,
             Box::new(self.client.clone().for_component("snapshot_recovery")),
+            Box::new(self.l1_client.clone().for_component("snapshot_recovery")),
             object_store,
             local_snapshot_dir,
         );
