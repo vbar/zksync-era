@@ -211,9 +211,8 @@ impl SnapshotsApplierL1Client for Box<DynClient<L1>> {
         &self,
         number: L1BatchNumber,
     ) -> EnrichedClientResult<H256> {
-        let eth_client: &dyn EthInterface = self;
         let block_id = BlockId::Number(number.0.into());
-        let block = eth_client.block(block_id).await?.ok_or_else(|| {
+        let block = self.block(block_id).await?.ok_or_else(|| {
             let err = "block missing on L1 RPC provider";
             EnrichedClientError::new(ClientError::Custom(err.into()), "get_block")
                 .with_arg("number", &number)
